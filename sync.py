@@ -263,6 +263,33 @@ def save_streak(streak: dict[str, int]) -> None:
         print(f"  . could not persist state to {STATE_FILE}: {e}", file=sys.stderr)
 
 
+def expand_ports(spec: str) -> set[int]:
+    """'2226,2230' -> {2226,2230};  '2456-2457' -> {2456,2457}
+
+    UniFi stores dst_port as a free-form string that may combine both forms, so a
+    reservation check that compares strings would miss a foreign rule covering
+    several ports and happily create a duplicate forward on top of it.
+    """
+    out: set[int] = set()
+    for part in str(spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        lo, sep, hi = part.partition("-")
+        try:
+            if sep:
+                out.update(range(int(lo), int(hi) + 1))
+            else:
+                out.add(int(lo))
+        except ValueError:
+            continue
+    return out
+
+
+def protos_overlap(a: str, b: str) -> bool:
+    return a == b or "tcp_udp" in (a, b)
+
+
 def unifi_site_id(forwards: list[dict]) -> str:
     for f in forwards:
         if f.get("site_id"):
@@ -336,10 +363,19 @@ def reconcile(dry_run: bool, stopped_streak: dict[str, int]) -> int:
     foreign = [f for f in forwards if not f.get("name", "").startswith(MARKER)]
 
     # Foreign rules reserve their ports. A desired rule colliding with one is
-    # skipped loudly -- never duplicated, never overwritten.
-    reserved: dict[tuple[str, str], str] = {}
-    for f in foreign:
-        reserved[(str(f.get("dst_port")), str(f.get("proto")))] = f.get("name", "?")
+    # skipped loudly -- never duplicated, never overwritten. Ports are expanded
+    # per-port so a combined foreign rule ("2226,2230") reserves each of them.
+    reserved: list[tuple[set[int], str, str]] = [
+        (expand_ports(f.get("dst_port", "")), str(f.get("proto")), f.get("name", "?"))
+        for f in foreign
+    ]
+
+    def collides(port_spec: str, proto: str) -> str | None:
+        wanted = expand_ports(port_spec)
+        for ports, fproto, fname in reserved:
+            if wanted & ports and protos_overlap(proto, fproto):
+                return fname
+        return None
 
     want = desired_state(instances, stopped_streak)
     if not dry_run:
@@ -350,13 +386,7 @@ def reconcile(dry_run: bool, stopped_streak: dict[str, int]) -> int:
     for name, spec in sorted(want.items()):
         cur = owned.get(name)
         if cur is None:
-            clash = reserved.get((spec["port"], spec["proto"]))
-            # tcp_udp overlaps both single-protocol rules, so check those too.
-            if clash is None and spec["proto"] == "tcp_udp":
-                clash = (reserved.get((spec["port"], "tcp"))
-                         or reserved.get((spec["port"], "udp")))
-            if clash is None:
-                clash = reserved.get((spec["port"], "tcp_udp"))
+            clash = collides(spec["port"], spec["proto"])
             if clash:
                 skips.append((name, spec, clash))
                 continue
