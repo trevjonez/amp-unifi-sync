@@ -54,6 +54,16 @@ sync.py             # loop at --interval (default 60s)
 sync.py --adopt map.json   # one-time: rename pre-existing rules into ownership
 ```
 
+## Tests
+
+```
+python3 -m unittest -v      # stdlib only, no dependencies
+```
+
+Covers the anti-clobber collision guard (including combined `"2226,2230"` and
+range rules), kvp port parsing against real AMP fixtures, RCON exclusion, and the
+debounce/crash-loop/sleep state machine. CI runs them before the image is built.
+
 ## Configuration (environment)
 
 | Var | Default | Notes |

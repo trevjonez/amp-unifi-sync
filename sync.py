@@ -290,6 +290,25 @@ def protos_overlap(a: str, b: str) -> bool:
     return a == b or "tcp_udp" in (a, b)
 
 
+def build_reservations(foreign: list[dict]) -> list[tuple[set[int], str, str]]:
+    """Foreign rules reserve every port they cover, expanded, so a combined rule
+    such as '2226,2230' blocks each port individually."""
+    return [
+        (expand_ports(f.get("dst_port", "")), str(f.get("proto")), f.get("name", "?"))
+        for f in foreign
+    ]
+
+
+def find_collision(reserved: list[tuple[set[int], str, str]],
+                   port_spec: str, proto: str) -> str | None:
+    """Name of the foreign rule blocking this (ports, proto), or None."""
+    wanted = expand_ports(port_spec)
+    for ports, fproto, fname in reserved:
+        if wanted & ports and protos_overlap(proto, fproto):
+            return fname
+    return None
+
+
 def unifi_site_id(forwards: list[dict]) -> str:
     for f in forwards:
         if f.get("site_id"):
@@ -362,20 +381,9 @@ def reconcile(dry_run: bool, stopped_streak: dict[str, int]) -> int:
     owned = {f["name"]: f for f in forwards if f.get("name", "").startswith(MARKER)}
     foreign = [f for f in forwards if not f.get("name", "").startswith(MARKER)]
 
-    # Foreign rules reserve their ports. A desired rule colliding with one is
-    # skipped loudly -- never duplicated, never overwritten. Ports are expanded
-    # per-port so a combined foreign rule ("2226,2230") reserves each of them.
-    reserved: list[tuple[set[int], str, str]] = [
-        (expand_ports(f.get("dst_port", "")), str(f.get("proto")), f.get("name", "?"))
-        for f in foreign
-    ]
-
-    def collides(port_spec: str, proto: str) -> str | None:
-        wanted = expand_ports(port_spec)
-        for ports, fproto, fname in reserved:
-            if wanted & ports and protos_overlap(proto, fproto):
-                return fname
-        return None
+    # A desired rule colliding with a foreign reservation is skipped loudly --
+    # never duplicated, never overwritten.
+    reserved = build_reservations(foreign)
 
     want = desired_state(instances, stopped_streak)
     if not dry_run:
@@ -386,7 +394,7 @@ def reconcile(dry_run: bool, stopped_streak: dict[str, int]) -> int:
     for name, spec in sorted(want.items()):
         cur = owned.get(name)
         if cur is None:
-            clash = collides(spec["port"], spec["proto"])
+            clash = find_collision(reserved, spec["port"], spec["proto"])
             if clash:
                 skips.append((name, spec, clash))
                 continue
