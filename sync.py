@@ -38,10 +38,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import html
+import http.server
 import json
 import os
+import re
 import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -74,6 +78,10 @@ DEBOUNCE_POLLS = int(os.environ.get("DEBOUNCE_POLLS", "3"))
 # debounce threshold and would leave stopped servers forwarded forever.
 STATE_FILE = os.environ.get("STATE_FILE", "/var/lib/amp-unifi-sync/state.json")
 
+# Read-only status GUI. Served in loop mode only; 0 disables it.
+HTTP_PORT = int(os.environ.get("HTTP_PORT", "8099"))
+HTTP_BIND = os.environ.get("HTTP_BIND", "0.0.0.0")
+
 # ADS is the control panel, not a game server. Excluded so its SFTP port (2223)
 # is never WAN-exposed. Comma-separated to override.
 EXCLUDE_INSTANCES = {
@@ -97,6 +105,43 @@ STATE_NAMES = {
 STOPPED_STATES = {0, 100, 200}
 
 PROTO = {0: "tcp", 1: "udp", 2: "tcp_udp"}
+
+
+# ------------------------------------------------------------------ redaction
+
+REDACTED = "«redacted»"
+# Credentials in a URL's userinfo (http://user:pass@host) -- an AMP_URL written
+# that way would otherwise reach the log through an exception message.
+_USERINFO = re.compile(r"(https?://)[^/\s:@]+:[^/\s@]+@", re.I)
+# Anything that looks like a secret-bearing key in JSON or a query string.
+_KEYED = re.compile(
+    r"([\"']?(?:password|passwd|pass|token|api[_-]?key|sessionid|secret)"
+    r"[\"']?\s*[:=]\s*)([\"']?)([^\"'&,}\s]+)", re.I)
+# Auth headers carry a scheme before the token ("Bearer abc"), so redacting only
+# the first word after the colon would leave the credential itself in place.
+_AUTH_HEADER = re.compile(r"(authorization\s*[:=]\s*)(.+)", re.I)
+
+
+def scrub(text: object) -> str:
+    """Remove credentials from anything about to be logged or served.
+
+    Defence in depth: the report is built from an explicit field allowlist and
+    never carries secrets, but error text is quoted from remote responses and
+    exception messages, which we do not control.
+    """
+    out = str(text)
+    for secret in (AMP_PASS, UNIFI_API_KEY):
+        # Length guard: a 1-2 char secret would redact half the page.
+        if secret and len(secret) >= 6:
+            out = out.replace(secret, REDACTED)
+    out = _USERINFO.sub(rf"\1{REDACTED}@", out)
+    out = _KEYED.sub(rf"\1\g<2>{REDACTED}", out)
+    out = _AUTH_HEADER.sub(rf"\1{REDACTED}", out)
+    return out
+
+
+def say(msg: object, err: bool = False) -> None:
+    print(scrub(msg), file=sys.stderr if err else sys.stdout)
 
 
 # ---------------------------------------------------------------- http helpers
@@ -228,6 +273,17 @@ def instance_ports(name: str, module: str) -> list[tuple[str, str, str]]:
     return specs
 
 
+def instance_game(name: str, module: str) -> str:
+    """Human label for what an instance runs, for the status page."""
+    base = os.path.join(AMP_INSTANCES_DIR, name)
+    if "Minecraft" in module:
+        mc = read_kvp(os.path.join(base, "MinecraftModule.kvp"))
+        variant = mc.get("Minecraft.ServerType", "").strip()
+        return f"Minecraft ({variant})" if variant else "Minecraft"
+    gen = read_kvp(os.path.join(base, "GenericModule.kvp"))
+    return gen.get("Meta.DisplayName", "").strip() or module or "unknown"
+
+
 # --------------------------------------------------------------- UniFi client
 
 def unifi(method: str, path: str = "", body: dict | None = None):
@@ -260,7 +316,7 @@ def save_streak(streak: dict[str, int]) -> None:
     except OSError as e:
         # Non-fatal: degrades to in-memory debounce, which fails safe (a fresh
         # streak needs DEBOUNCE_POLLS readings before anything closes).
-        print(f"  . could not persist state to {STATE_FILE}: {e}", file=sys.stderr)
+        say(f"  . could not persist state to {STATE_FILE}: {e}", err=True)
 
 
 def expand_ports(spec: str) -> set[int]:
@@ -340,7 +396,9 @@ def desired_state(instances: list[dict], stopped_streak: dict[str, int]) -> dict
         sftp_enabled = bool(inst.get("Running")) and not inst.get("Suspended")
 
         label = STATE_NAMES.get(state, str(state))
-        for kind, port, proto in instance_ports(name, inst.get("Module", "")):
+        module = inst.get("Module", "")
+        game = instance_game(name, module)
+        for kind, port, proto in instance_ports(name, module):
             is_sftp = kind == "sftp"
             want[f"{MARKER} {name} {kind}"] = {
                 "port": port,
@@ -348,8 +406,37 @@ def desired_state(instances: list[dict], stopped_streak: dict[str, int]) -> dict
                 "enabled": sftp_enabled if is_sftp else game_enabled,
                 "state": f"instance {'up' if sftp_enabled else 'down'}" if is_sftp else label,
                 "streak": streak,
+                # Carried for the status page so it can group and explain.
+                "instance": name,
+                "kind": kind,
+                "game": game,
+                "app_state": label,
+                "instance_up": sftp_enabled,
             }
     return want
+
+
+def explain(spec: dict, blocked_by: str | None, error: str | None) -> tuple[str, str]:
+    """(status, human reason) for one desired forward — the 'why' the GUI shows."""
+    if error:
+        return "error", error
+    if blocked_by:
+        return "blocked", (f"port {spec['port']}/{spec['proto']} is already used by "
+                           f"“{blocked_by}”, a rule this tool does not manage")
+    if spec["kind"] == "sftp":
+        if spec["enabled"]:
+            return "open", "instance is up"
+        return "closed", "instance is not running"
+    if spec["enabled"]:
+        streak = spec.get("streak", 0)
+        if streak:
+            left = DEBOUNCE_POLLS - streak
+            return "open", (f"server is {spec['app_state']} — closing in {left} "
+                            f"more poll{'s' if left != 1 else ''}")
+        if spec["app_state"] == "Sleeping":
+            return "open", "server is asleep and wakes on connect, so the port stays open"
+        return "open", f"server is {spec['app_state']}"
+    return "closed", f"server is {spec['app_state']}"
 
 
 def build_doc(name: str, spec: dict, site_id: str) -> dict:
@@ -437,7 +524,11 @@ def reconcile(dry_run: bool, stopped_streak: dict[str, int]) -> int:
     if not (creates or updates or deletes):
         print("  (converged)")
 
+    blocked = {name: clash for name, _spec, clash in skips}
+    errors: dict[str, str] = {}
+
     if dry_run:
+        publish_report(instances, want, blocked, errors, len(foreign))
         return 0
 
     for name, spec in creates:
@@ -445,23 +536,232 @@ def reconcile(dry_run: bool, stopped_streak: dict[str, int]) -> int:
             unifi("POST", "", build_doc(name, spec, site_id))
             print(f"  + {name}")
         except urllib.error.HTTPError as e:
-            print(f"  ! create {name}: {e.code} {e.read().decode()[:120]}", file=sys.stderr)
+            errors[name] = f"create failed: HTTP {e.code}"
+            say(f"  ! create {name}: {e.code} {e.read().decode()[:120]}", err=True)
 
     for name, cur, diff in updates:
         try:
             unifi("PUT", f"/{cur['_id']}", {**cur, **diff})
             print(f"  ~ {name}")
         except urllib.error.HTTPError as e:
-            print(f"  ! update {name}: {e.code} {e.read().decode()[:120]}", file=sys.stderr)
+            errors[name] = f"update failed: HTTP {e.code}"
+            say(f"  ! update {name}: {e.code} {e.read().decode()[:120]}", err=True)
 
     for name, cur in deletes:
         try:
             unifi("DELETE", f"/{cur['_id']}")
             print(f"  - {name}")
         except urllib.error.HTTPError as e:
-            print(f"  ! delete {name}: {e.code} {e.read().decode()[:120]}", file=sys.stderr)
+            errors[name] = f"delete failed: HTTP {e.code}"
+            say(f"  ! delete {name}: {e.code} {e.read().decode()[:120]}", err=True)
 
+    publish_report(instances, want, blocked, errors, len(foreign))
     return 0
+
+
+# ------------------------------------------------------------- status reporting
+
+_REPORT: dict | None = None
+_REPORT_LOCK = threading.Lock()
+
+STATUS_ORDER = {"error": 0, "blocked": 1, "closed": 2, "open": 3}
+
+
+def build_report(instances: list[dict], want: dict[str, dict], blocked: dict[str, str],
+                 errors: dict[str, str], foreign_count: int) -> dict:
+    """Structured view of the last pass. Shared by the text log and the web GUI so
+    they can never disagree about why a forward is missing."""
+    by_instance: dict[str, dict] = {}
+
+    for inst in instances:
+        name = inst.get("InstanceName", "")
+        if not name:
+            continue
+        module = inst.get("Module", "")
+        excluded = name in EXCLUDE_INSTANCES
+        by_instance[name] = {
+            "name": name,
+            "game": instance_game(name, module) if not excluded else "AMP controller",
+            "module": module,
+            "app_state": STATE_NAMES.get(inst.get("AppState", -1), str(inst.get("AppState"))),
+            "instance_up": bool(inst.get("Running")) and not inst.get("Suspended"),
+            "excluded": excluded,
+            "note": "excluded from forwarding by configuration" if excluded else "",
+            "rules": [],
+        }
+
+    for rule_name, spec in sorted(want.items()):
+        status, reason = explain(spec, blocked.get(rule_name), errors.get(rule_name))
+        row = by_instance.setdefault(spec["instance"], {
+            "name": spec["instance"], "game": spec.get("game", ""), "module": "",
+            "app_state": spec.get("app_state", ""), "instance_up": True,
+            "excluded": False, "note": "", "rules": [],
+        })
+        row["rules"].append({
+            "name": rule_name, "kind": spec["kind"], "port": spec["port"],
+            "proto": spec["proto"], "status": status, "reason": reason,
+        })
+
+    for row in by_instance.values():
+        row["rules"].sort(key=lambda r: (r["kind"] != "game", r["port"]))
+        if not row["rules"] and not row["excluded"]:
+            row["note"] = "no forwardable ports declared by this instance"
+
+    counts: dict[str, int] = {}
+    for row in by_instance.values():
+        for r in row["rules"]:
+            counts[r["status"]] = counts.get(r["status"], 0) + 1
+
+    ordered = sorted(
+        by_instance.values(),
+        key=lambda row: (row["excluded"],
+                         min((STATUS_ORDER.get(r["status"], 9) for r in row["rules"]),
+                             default=9),
+                         row["name"].lower()),
+    )
+    return {
+        "generated": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "generated_epoch": time.time(),
+        "marker": MARKER,
+        "target": FWD_TARGET,
+        "foreign_count": foreign_count,
+        "counts": counts,
+        "instances": ordered,
+    }
+
+
+def publish_report(instances, want, blocked, errors, foreign_count) -> None:
+    global _REPORT
+    report = build_report(instances, want, blocked, errors, foreign_count)
+    with _REPORT_LOCK:
+        _REPORT = report
+
+
+BADGE = {"open": "ok", "closed": "off", "blocked": "warn", "error": "err"}
+
+PAGE_CSS = """
+:root{--bg:#f6f7f9;--card:#fff;--fg:#14171a;--muted:#5b6570;--line:#e3e6ea;
+--ok:#0f7b43;--off:#6b7280;--warn:#a8600a;--err:#b3261e}
+@media(prefers-color-scheme:dark){:root{--bg:#14171a;--card:#1c2024;--fg:#e7eaee;
+--muted:#9aa4af;--line:#2b3138;--ok:#4ade80;--off:#9aa4af;--warn:#fbbf24;--err:#f87171}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+.wrap{max-width:1000px;margin:0 auto;padding:24px 16px 48px}
+h1{font-size:20px;margin:0 0 4px}
+.sub{color:var(--muted);font-size:13px;margin-bottom:20px}
+.tiles{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:20px}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:8px;
+padding:8px 14px;min-width:92px}
+.tile b{display:block;font-size:20px;line-height:1.2}
+.tile span{color:var(--muted);font-size:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;
+padding:14px 16px;margin-bottom:12px}
+.card.dim{opacity:.6}
+.hdr{display:flex;flex-wrap:wrap;gap:8px;align-items:baseline;margin-bottom:10px}
+.hdr h2{font-size:15px;margin:0}
+.hdr .game{color:var(--muted);font-size:13px}
+.hdr .state{margin-left:auto;color:var(--muted);font-size:12px}
+table{width:100%;border-collapse:collapse}
+td{padding:6px 8px;border-top:1px solid var(--line);vertical-align:top}
+tr:first-child td{border-top:0}
+td.port{white-space:nowrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;width:1%}
+td.kind{color:var(--muted);width:1%;white-space:nowrap}
+td.reason{color:var(--muted)}
+.badge{display:inline-block;min-width:64px;text-align:center;padding:2px 8px;
+border-radius:999px;font-size:12px;font-weight:600;border:1px solid currentColor}
+.ok{color:var(--ok)} .off{color:var(--off)} .warn{color:var(--warn)} .err{color:var(--err)}
+.note{color:var(--muted);font-size:13px;font-style:italic}
+footer{color:var(--muted);font-size:12px;margin-top:24px;text-align:center}
+.scroll{overflow-x:auto}
+"""
+
+
+def render_html(report: dict | None) -> str:
+    esc = html.escape
+    if report is None:
+        return ("<!doctype html><meta charset=utf-8><meta http-equiv=refresh content=5>"
+                f"<title>AMP port forwards</title><style>{PAGE_CSS}</style>"
+                "<div class=wrap><h1>AMP port forwards</h1>"
+                "<p class=sub>Waiting for the first reconcile pass…</p></div>")
+
+    c = report["counts"]
+    tiles = "".join(
+        f'<div class="tile"><b class="{BADGE[k]}">{c.get(k,0)}</b><span>{k}</span></div>'
+        for k in ("open", "closed", "blocked", "error") if c.get(k)
+    ) or '<div class="tile"><b>0</b><span>rules</span></div>'
+
+    cards = []
+    for row in report["instances"]:
+        rules = "".join(
+            f'<tr><td class="port">{esc(r["port"])}/{esc(r["proto"])}</td>'
+            f'<td class="kind">{esc(r["kind"])}</td>'
+            f'<td><span class="badge {BADGE[r["status"]]}">{r["status"]}</span></td>'
+            f'<td class="reason">{esc(r["reason"])}</td></tr>'
+            for r in row["rules"]
+        )
+        body = (f'<div class="scroll"><table>{rules}</table></div>' if rules
+                else f'<p class="note">{esc(row["note"] or "nothing to forward")}</p>')
+        cards.append(
+            f'<div class="card{" dim" if row["excluded"] or not row["rules"] else ""}">'
+            f'<div class="hdr"><h2>{esc(row["name"])}</h2>'
+            f'<span class="game">{esc(row["game"])}</span>'
+            f'<span class="state">{esc(row["app_state"])}</span></div>{body}</div>'
+        )
+
+    return (
+        "<!doctype html><html><head><meta charset=utf-8>"
+        '<meta name=viewport content="width=device-width,initial-scale=1">'
+        '<meta http-equiv=refresh content=30>'
+        "<title>AMP port forwards</title>"
+        f"<style>{PAGE_CSS}</style></head><body><div class=wrap>"
+        "<h1>AMP port forwards</h1>"
+        f'<p class="sub">Forwards to {esc(report["target"])}, reconciled from AMP instance '
+        f'state. {report["foreign_count"]} unmanaged rule(s) on the gateway are left '
+        f'untouched.</p>{tiles}{"".join(cards)}'
+        f'<footer>last pass {esc(report["generated"])} · rules named '
+        f'<code>{esc(report["marker"])}</code> · read-only</footer>'
+        "</div></body></html>"
+    )
+
+
+def start_http_server(port: int, bind: str, interval: int) -> None:
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def _send(self, code: int, body: bytes, ctype: str) -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):  # noqa: N802
+            with _REPORT_LOCK:
+                report = _REPORT
+            path = self.path.split("?", 1)[0].rstrip("/") or "/"
+            if path == "/":
+                self._send(200, scrub(render_html(report)).encode(),
+                       "text/html; charset=utf-8")
+            elif path == "/api/status":
+                self._send(200, scrub(json.dumps(report or {}, indent=2)).encode(),
+                           "application/json")
+            elif path == "/healthz":
+                # Stale if several passes have been missed -- the reconciler is wedged.
+                age = time.time() - report["generated_epoch"] if report else None
+                ok = age is not None and age < max(interval * 5, 300)
+                self._send(200 if ok else 503,
+                           json.dumps({"ok": ok, "age_seconds": age}).encode(),
+                           "application/json")
+            else:
+                self._send(404, b"not found\n", "text/plain")
+
+        def log_message(self, *_args):
+            pass  # the reconcile log is the useful one; access logs only add noise
+
+    srv = http.server.ThreadingHTTPServer((bind, port), Handler)
+    threading.Thread(target=srv.serve_forever, name="http", daemon=True).start()
+    print(f"status GUI on http://{bind}:{port}/ (read-only)")
 
 
 # ----------------------------------------------------------------- adoption
@@ -475,7 +775,7 @@ def adopt(dry_run: bool, map_path: str) -> int:
         with open(map_path, encoding="utf-8") as fh:
             raw_map = json.load(fh)
     except (OSError, ValueError) as e:
-        print(f"could not read adopt map {map_path}: {e}", file=sys.stderr)
+        say(f"could not read adopt map {map_path}: {e}", err=True)
         return 2
 
     adoptions = {old: f"{MARKER} {new}" for old, new in raw_map.items()}
@@ -499,7 +799,7 @@ def adopt(dry_run: bool, map_path: str) -> int:
             unifi("PUT", f"/{cur['_id']}", {**cur, "name": new})
             print(f"  ~ {old} -> {new}")
         except urllib.error.HTTPError as e:
-            print(f"  ! rename {old}: {e.code} {e.read().decode()[:120]}", file=sys.stderr)
+            say(f"  ! rename {old}: {e.code} {e.read().decode()[:120]}", err=True)
     return 0
 
 
@@ -528,11 +828,14 @@ def main() -> int:
     if args.once or args.dry_run:
         return reconcile(args.dry_run, stopped_streak)
 
+    if HTTP_PORT:
+        start_http_server(HTTP_PORT, HTTP_BIND, args.interval)
+
     while True:
         try:
             reconcile(False, stopped_streak)
         except Exception as e:  # keep the loop alive across transient failures
-            print(f"! reconcile failed: {type(e).__name__}: {e}", file=sys.stderr)
+            say(f"! reconcile failed: {type(e).__name__}: {e}", err=True)
         time.sleep(args.interval)
 
 

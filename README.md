@@ -54,6 +54,25 @@ sync.py             # loop at --interval (default 60s)
 sync.py --adopt map.json   # one-time: rename pre-existing rules into ownership
 ```
 
+## Status GUI
+
+In loop mode the container serves a **read-only** status page on `HTTP_PORT`:
+
+| Path | |
+|---|---|
+| `/` | per-instance status, worst first, auto-refreshing |
+| `/api/status` | the same report as JSON |
+| `/healthz` | 503 once several passes have been missed (reconciler wedged) |
+
+The point of the page is the **reason** column — why a forward is not open:
+which unmanaged rule is holding the port, how many polls until a stopped server's
+port closes, or why a sleeping server stays open. There are no mutating endpoints.
+
+Everything logged or served passes through a credential scrubber: the report is
+built from an explicit field allowlist, and error text quoted from remote
+responses has literal secrets, URL userinfo, `password`/`token`/`api_key`-style
+values and `Authorization` headers redacted.
+
 ## Tests
 
 ```
@@ -79,6 +98,8 @@ debounce/crash-loop/sleep state machine. CI runs them before the image is built.
 | `MARKER` | `[amp-sync]` | ownership prefix — changing it orphans existing rules |
 | `DEBOUNCE_POLLS` | `3` | consecutive stopped polls before a game port closes |
 | `EXCLUDE_INSTANCES` | `Main` | ADS controller; keeps its SFTP port off the WAN |
+| `HTTP_PORT` | `8099` | read-only status GUI (loop mode only); `0` disables |
+| `HTTP_BIND` | `0.0.0.0` | bind address for the GUI |
 | `STATE_FILE` | `/var/lib/amp-unifi-sync/state.json` | debounce counters; mount a volume |
 
 The UDM serves a self-signed certificate, so UniFi calls skip verification (the

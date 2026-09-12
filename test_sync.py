@@ -294,5 +294,163 @@ class BuildDocTests(unittest.TestCase):
         self.assertNotIn("_id", doc)
 
 
+class ScrubTests(unittest.TestCase):
+    """Nothing logged or served may carry a credential."""
+
+    def setUp(self):
+        self._pass, self._key = sync.AMP_PASS, sync.UNIFI_API_KEY
+        sync.AMP_PASS = "sup3rSecretAmpPassword"
+        sync.UNIFI_API_KEY = "abcdef0123456789unifikey"
+
+        def restore():
+            sync.AMP_PASS, sync.UNIFI_API_KEY = self._pass, self._key
+        self.addCleanup(restore)
+
+    def test_literal_secrets_are_removed(self):
+        out = sync.scrub("login failed for sup3rSecretAmpPassword via abcdef0123456789unifikey")
+        self.assertNotIn("sup3rSecretAmpPassword", out)
+        self.assertNotIn("abcdef0123456789unifikey", out)
+        self.assertIn(sync.REDACTED, out)
+
+    def test_url_userinfo_is_removed(self):
+        out = sync.scrub("failed: http://admin:hunter2@amp.local:8080/API/Core/Login")
+        self.assertNotIn("hunter2", out)
+        self.assertIn("amp.local", out, "the host itself is useful and should survive")
+
+    def test_keyed_values_are_removed(self):
+        for probe, leaked in [
+            ('{"password":"hunter2","x":1}', "hunter2"),
+            ("api_key=deadbeefcafe&z=1", "deadbeefcafe"),
+            ('{"SESSIONID": "9f8e7d6c"}', "9f8e7d6c"),
+            ("Authorization: Bearer abc123xyz", "abc123xyz"),
+        ]:
+            with self.subTest(probe=probe):
+                self.assertNotIn(leaked, sync.scrub(probe))
+
+    def test_short_secret_is_not_used_as_a_needle(self):
+        # A 2-char secret would otherwise redact unrelated text into nonsense.
+        sync.AMP_PASS = "ab"
+        self.assertEqual(sync.scrub("a stable cabin"), "a stable cabin")
+
+    def test_empty_credentials_do_not_blank_everything(self):
+        sync.AMP_PASS = ""
+        sync.UNIFI_API_KEY = ""
+        self.assertEqual(sync.scrub("plain text"), "plain text")
+
+
+class ExplainTests(unittest.TestCase):
+    def spec(self, **kw):
+        base = {"port": "34197", "proto": "udp", "enabled": True, "kind": "game",
+                "app_state": "Ready", "streak": 0}
+        base.update(kw)
+        return base
+
+    def test_blocked_names_the_conflicting_rule(self):
+        status, reason = sync.explain(self.spec(), "AMP - SFTP", None)
+        self.assertEqual(status, "blocked")
+        self.assertIn("AMP - SFTP", reason)
+        self.assertIn("34197/udp", reason)
+
+    def test_error_takes_precedence_over_everything(self):
+        status, reason = sync.explain(self.spec(), "Some Rule", "create failed: HTTP 400")
+        self.assertEqual(status, "error")
+        self.assertIn("HTTP 400", reason)
+
+    def test_open_reports_the_app_state(self):
+        status, reason = sync.explain(self.spec(), None, None)
+        self.assertEqual(status, "open")
+        self.assertIn("Ready", reason)
+
+    def test_sleeping_explains_why_it_stays_open(self):
+        status, reason = sync.explain(self.spec(app_state="Sleeping"), None, None)
+        self.assertEqual(status, "open")
+        self.assertIn("wakes on connect", reason)
+
+    def test_pending_close_counts_down(self):
+        status, reason = sync.explain(
+            self.spec(app_state="Stopped", streak=sync.DEBOUNCE_POLLS - 1), None, None)
+        self.assertEqual(status, "open")
+        self.assertIn("closing in 1 more poll", reason)
+
+    def test_closed_game_says_why(self):
+        status, reason = sync.explain(
+            self.spec(enabled=False, app_state="Stopped"), None, None)
+        self.assertEqual(status, "closed")
+        self.assertIn("Stopped", reason)
+
+    def test_sftp_reasons_reference_the_instance_not_the_game(self):
+        up = sync.explain(self.spec(kind="sftp"), None, None)
+        down = sync.explain(self.spec(kind="sftp", enabled=False), None, None)
+        self.assertEqual((up[0], down[0]), ("open", "closed"))
+        self.assertIn("instance", up[1])
+        self.assertIn("instance", down[1])
+
+
+class ReportTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self._orig = sync.AMP_INSTANCES_DIR
+        sync.AMP_INSTANCES_DIR = self.tmp.name
+        self.addCleanup(lambda: setattr(sync, "AMP_INSTANCES_DIR", self._orig))
+        write_instance(self.tmp.name, "Fac", generic=FACTORIO_PORTS, sftp=("True", "2227"))
+        write_instance(self.tmp.name, "MC", mc_port="25565", sftp=("True", "2224"))
+
+    def report(self, blocked=None, errors=None, insts=None):
+        insts = insts or [inst("Fac", 20), inst("MC", 50, module="MinecraftModule")]
+        want = sync.desired_state(insts, {})
+        return sync.build_report(insts, want, blocked or {}, errors or {}, 4)
+
+    def test_rules_are_grouped_under_their_instance(self):
+        rep = self.report()
+        names = {r["name"] for r in rep["instances"]}
+        self.assertEqual(names, {"Fac", "MC"})
+        for row in rep["instances"]:
+            self.assertTrue(row["rules"])
+
+    def test_game_display_name_is_resolved(self):
+        rep = self.report()
+        games = {r["name"]: r["game"] for r in rep["instances"]}
+        self.assertEqual(games["Fac"], "Test Game")     # Meta.DisplayName
+        self.assertEqual(games["MC"], "Minecraft")
+
+    def test_excluded_instance_is_listed_but_has_no_rules(self):
+        insts = [inst("Fac", 20), inst("Main", -1, module="ADSModule")]
+        rep = self.report(insts=insts)
+        main = next(r for r in rep["instances"] if r["name"] == "Main")
+        self.assertEqual(main["rules"], [])
+        self.assertIn("excluded", main["note"])
+
+    def test_problems_sort_above_healthy_instances(self):
+        rep = self.report(blocked={"[amp-sync] MC game": "Hand Rule"})
+        self.assertEqual(rep["instances"][0]["name"], "MC",
+                         "an instance with a blocked rule must surface first")
+
+    def test_counts_tally_the_statuses(self):
+        rep = self.report(blocked={"[amp-sync] MC game": "Hand Rule"})
+        self.assertEqual(rep["counts"].get("blocked"), 1)
+        self.assertEqual(sum(rep["counts"].values()),
+                         sum(len(r["rules"]) for r in rep["instances"]))
+
+    def test_report_carries_no_credentials(self):
+        # The report is built from an explicit allowlist; prove it stays that way.
+        rep = self.report()
+        blob = json.dumps(rep)
+        for probe in ("password", "SESSIONID", "api_key", "X-API-KEY"):
+            self.assertNotIn(probe.lower(), blob.lower())
+
+    def test_rendered_html_escapes_and_carries_no_credentials(self):
+        rep = self.report(blocked={"[amp-sync] Fac game": '<script>alert(1)</script>'})
+        page = sync.render_html(rep)
+        self.assertNotIn("<script>alert(1)</script>", page)
+        self.assertIn("&lt;script&gt;", page)
+        for probe in ("password", "SESSIONID", "X-API-KEY"):
+            self.assertNotIn(probe.lower(), page.lower())
+
+    def test_render_handles_no_report_yet(self):
+        page = sync.render_html(None)
+        self.assertIn("Waiting", page)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
