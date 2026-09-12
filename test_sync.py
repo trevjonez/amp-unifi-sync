@@ -73,7 +73,7 @@ class PortSpecTests(unittest.TestCase):
     def test_expand_single_range_and_list(self):
         self.assertEqual(sync.expand_ports("25565"), {25565})
         self.assertEqual(sync.expand_ports("2456-2457"), {2456, 2457})
-        self.assertEqual(sync.expand_ports("2226,2230"), {2226, 2230})
+        self.assertEqual(sync.expand_ports("3100,3200"), {3100, 3200})
         self.assertEqual(sync.expand_ports("16261-16262,27015"), {16261, 16262, 27015})
 
     def test_expand_tolerates_junk(self):
@@ -100,13 +100,14 @@ class CollisionTests(unittest.TestCase):
     forwards on top of hand-managed rules."""
 
     def test_combined_foreign_rule_reserves_each_port(self):
-        # Regression: 'AMP - SFTP' covers "2226,2230". A string comparison missed
-        # it and would have created duplicate forwards on both ports.
+        # Regression: a legacy rule covering two discrete ports in one entry.
+        # The old check compared port strings, so a single-port desired rule never
+        # matched it and would have created a duplicate forward on top of it.
         reserved = sync.build_reservations(
-            [{"name": "AMP - SFTP", "dst_port": "2226,2230", "proto": "tcp_udp"}])
-        self.assertEqual(sync.find_collision(reserved, "2226", "tcp"), "AMP - SFTP")
-        self.assertEqual(sync.find_collision(reserved, "2230", "tcp"), "AMP - SFTP")
-        self.assertIsNone(sync.find_collision(reserved, "2227", "tcp"))
+            [{"name": "Legacy combined", "dst_port": "3100,3200", "proto": "tcp_udp"}])
+        self.assertEqual(sync.find_collision(reserved, "3100", "tcp"), "Legacy combined")
+        self.assertEqual(sync.find_collision(reserved, "3200", "tcp"), "Legacy combined")
+        self.assertIsNone(sync.find_collision(reserved, "3150", "tcp"))
 
     def test_range_foreign_rule_reserves_interior_ports(self):
         reserved = sync.build_reservations(
@@ -166,10 +167,10 @@ class InstancePortTests(unittest.TestCase):
                          [("game", "7210", "tcp_udp")])
 
     def test_minecraft_uses_scalar_port_and_is_tcp(self):
-        write_instance(self.tmp.name, "MC", mc_port="25568", sftp=("True", "2226"))
+        write_instance(self.tmp.name, "MC", mc_port="25568", sftp=("True", "2299"))
         specs = sync.instance_ports("MC", "MinecraftModule")
         self.assertIn(("game", "25568", "tcp"), specs)
-        self.assertIn(("sftp", "2226", "tcp"), specs)
+        self.assertIn(("sftp", "2299", "tcp"), specs)
 
     def test_sftp_disabled_is_omitted(self):
         write_instance(self.tmp.name, "Off", generic=FACTORIO_PORTS, sftp=("False", "2299"))
@@ -346,9 +347,9 @@ class ExplainTests(unittest.TestCase):
         return base
 
     def test_blocked_names_the_conflicting_rule(self):
-        status, reason = sync.explain(self.spec(), "AMP - SFTP", None)
+        status, reason = sync.explain(self.spec(), "Legacy combined", None)
         self.assertEqual(status, "blocked")
-        self.assertIn("AMP - SFTP", reason)
+        self.assertIn("Legacy combined", reason)
         self.assertIn("34197/udp", reason)
 
     def test_error_takes_precedence_over_everything(self):
